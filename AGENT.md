@@ -27,3 +27,7 @@ Bid every day on the event:
 ## Execution Notes
 - Prefer using web.run to fetch the latest Wunderground data when needed.
 - Keep records of daily bids and rationale when appropriate.
+
+## Auth Notes
+- Google/Magic login uses a proxy wallet: signature type `1` and funder address should be the proxy wallet address shown on Polymarket.
+- L1 auth uses the exported private key; L2 auth uses API key/secret/passphrase (store only in `.env`).
