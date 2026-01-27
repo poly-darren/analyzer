@@ -480,17 +480,17 @@ const persistNotifyState = () => {
   }
 };
 
-const notifyBrowser = (message: string) => {
+const notifyBrowser = (title: string, message: string) => {
   if (typeof window === "undefined") return;
   if (!("Notification" in window)) return;
   if (Notification.permission === "granted") {
-    new Notification("New day high", { body: message, tag: "day-high" });
+    new Notification(title, { body: message, tag: "day-high" });
     return;
   }
   if (Notification.permission === "default") {
     Notification.requestPermission().then((permission) => {
       if (permission === "granted") {
-        new Notification("New day high", { body: message, tag: "day-high" });
+        new Notification(title, { body: message, tag: "day-high" });
       }
     });
   }
@@ -499,7 +499,7 @@ const notifyBrowser = (message: string) => {
 const triggerTestNotification = () => {
   const message = "Test notification: new day high";
   showHighNotice(message);
-  notifyBrowser(message);
+  notifyBrowser("New day high: -2.0°C", message);
   if (soundEnabled.value) {
     playBeep();
   }
@@ -525,9 +525,11 @@ const maybeNotifyNewHigh = (next: Dashboard) => {
   }
 
   if (dayHigh > lastNotifiedHigh + 1e-6) {
-    const message = `New day high: ${formatTemp(dayHigh)} (KST)`;
+    const tempText = formatTemp(dayHigh);
+    const message = `New day high: ${tempText} (KST)`;
+    const title = `New day high: ${tempText}`;
     showHighNotice(message);
-    notifyBrowser(message);
+    notifyBrowser(title, message);
     if (soundEnabled.value) {
       playBeep();
     }
