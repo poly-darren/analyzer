@@ -164,15 +164,24 @@ async def _fetch_event(slug: str) -> Optional[Dict[str, Any]]:
     return resp.json()
 
 
-async def _fetch_price(token_id: str) -> Optional[float]:
+async def _fetch_best_ask(token_id: str) -> Optional[float]:
     assert _http_client
-    params = {"token_id": token_id, "side": "buy"}
-    resp = await _http_client.get(f"{CLOB_HOST}/price", params=params)
+    resp = await _http_client.get(f"{CLOB_HOST}/book", params={"token_id": token_id})
     if resp.status_code != 200:
         return None
     data = resp.json()
     try:
-        return float(data.get("price"))
+        asks = data.get("asks")
+        if isinstance(asks, list) and asks:
+            prices = [
+                _coerce_float(ask.get("price"))
+                for ask in asks
+                if isinstance(ask, dict)
+            ]
+            prices = [p for p in prices if isinstance(p, (int, float))]
+            if prices:
+                return min(prices)
+        return None
     except (TypeError, ValueError):
         return None
 
@@ -351,11 +360,11 @@ async def dashboard() -> Dict[str, Any]:
             no_price = None
             if token_yes:
                 yes_price = await _cached(
-                    f"price:{token_yes}", lambda: _fetch_price(token_yes)
+                    f"price:{token_yes}", lambda: _fetch_best_ask(token_yes)
                 )
             if token_no:
                 no_price = await _cached(
-                    f"price:{token_no}", lambda: _fetch_price(token_no)
+                    f"price:{token_no}", lambda: _fetch_best_ask(token_no)
                 )
             if yes_price is None or yes_price <= 0:
                 yes_price = _coerce_float(market.get("bestAsk")) or _coerce_float(
