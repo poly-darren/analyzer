@@ -146,50 +146,60 @@ body {
   background: var(--accent);
 }
 
-.dot.forecast {
+.dot.checkwx {
   background: var(--accent-2);
 }
 
-.chart {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.chart svg {
+.chart-container {
+  flex: 1;
+  min-height: 360px;
+  max-height: 520px;
+  position: relative;
   width: 100%;
-  height: 240px;
-  border-radius: 16px;
 }
 
-.chart-bg {
-  fill: #f6f7f8;
-  rx: 16px;
-}
-
-.grid-lines line {
-  stroke: rgba(15, 27, 36, 0.08);
-  stroke-width: 1;
-}
-
-.line {
-  fill: none;
-  stroke-width: 3;
-}
-
-.line.actual {
-  stroke: var(--accent);
-}
-
-.line.forecast {
-  stroke: var(--accent-2);
-}
-
-.axis {
+.loading-chart {
   display: flex;
-  justify-content: space-between;
-  font-size: 11px;
+  align-items: center;
+  justify-content: center;
+  height: 360px;
   color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.y-axis text,
+.x-axis text {
+  fill: var(--muted);
+  font-size: 15px;
+  font-weight: 500;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.x-axis text {
+  text-anchor: middle;
+}
+
+.hover-line {
+  stroke: rgba(31, 122, 140, 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+
+.hover-dot {
+  fill: var(--accent);
+  stroke: #f6f7f8;
+  stroke-width: 2;
+}
+
+.tooltip rect {
+  fill: #0f1b24;
+  opacity: 0.92;
+}
+
+.tooltip text {
+  fill: #f6f7f8;
+  font-size: 12px;
+  font-family: "IBM Plex Mono", monospace;
 }
 
 .table {
@@ -204,11 +214,10 @@ body {
 }
 
 .market-table .row {
-  grid-template-columns: 1fr 80px;
-}
-
-.positions-table .row {
-  grid-template-columns: 1fr 80px 80px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px 72px;
+  align-items: center;
+  gap: 12px;
 }
 
 .row.header {
@@ -226,8 +235,53 @@ body {
   text-align: right;
 }
 
+.market-table .row .right {
+  justify-self: end;
+}
+
+.market-label {
+  text-align: left;
+  justify-self: start;
+}
+
 .row.empty {
   color: var(--muted);
+}
+
+.market-row {
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+}
+
+.market-row.match-high {
+  border-color: rgba(208, 140, 42, 0.5);
+  background: rgba(208, 140, 42, 0.12);
+}
+
+.market-row.locked {
+  opacity: 0.65;
+}
+
+.market-row.locked .name,
+.market-row.locked .price {
+  text-decoration: line-through;
+}
+
+.outcome {
+  flex: 1;
+  display: flex;
+  gap: 4px;
+}
+
+.outcome .name {
+  font-weight: 600;
+}
+
+.price {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 14px;
 }
 
 .badge {
@@ -247,18 +301,6 @@ body {
 .badge.warn {
   background: rgba(208, 140, 42, 0.15);
   color: var(--accent-2);
-}
-
-.balance {
-  text-align: right;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.balance strong {
-  display: block;
-  font-size: 18px;
-  color: var(--ink);
 }
 
 .truncate {
@@ -294,16 +336,12 @@ body {
     width: 100%;
   }
 
-  .positions-table .row {
-    grid-template-columns: 1fr 70px 70px;
-  }
-
   .panel-header {
     flex-direction: column;
     align-items: flex-start;
   }
 
-  .balance {
-    text-align: left;
+  .market-table .row {
+    grid-template-columns: minmax(0, 1fr) 60px 60px;
   }
 }

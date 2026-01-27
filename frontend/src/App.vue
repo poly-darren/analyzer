@@ -16,42 +16,34 @@
           <strong>{{ formatTemp(dashboard?.weather?.dayHigh) }}</strong>
         </div>
         <div class="metric">
-          <span>Last Refresh</span>
+          <span>Last Refresh (KST)</span>
           <strong>{{ formatTime(dashboard?.meta?.lastRefresh) }}</strong>
         </div>
       </div>
     </header>
 
     <main class="grid">
-      <section class="panel">
+      <section class="panel weather-panel">
         <div class="panel-header">
           <div>
-            <h2>Weather (Hourly)</h2>
-            <p>Forecast vs Actual — Asia/Seoul</p>
+            <h2>Weather (30‑min)</h2>
+            <p>Actual — METAR + CheckWX</p>
           </div>
           <div class="legend">
-            <span class="dot actual"></span> Actual
-            <span class="dot forecast"></span> Forecast
+            <span><span class="dot actual"></span> AWC</span>
+            <span><span class="dot checkwx"></span> CheckWX</span>
+            <span
+              v-if="sourceMatch !== null"
+              class="badge"
+              :class="sourceMatch ? 'ok' : 'warn'"
+            >
+              {{ sourceMatch ? "Sources match" : `Mismatch ${formatDelta(sourceDelta)}` }}
+            </span>
           </div>
         </div>
-        <div class="chart">
-          <svg viewBox="0 0 1000 260" role="img" aria-label="Temperature chart">
-            <defs>
-              <linearGradient id="forecastGlow" x1="0" x2="0" y1="0" y2="1">
-                <stop offset="0%" stop-color="#f2b04c" stop-opacity="0.4" />
-                <stop offset="100%" stop-color="#f2b04c" stop-opacity="0" />
-              </linearGradient>
-            </defs>
-            <rect x="0" y="0" width="1000" height="260" class="chart-bg" />
-            <g class="grid-lines">
-              <line v-for="n in 4" :key="n" :x1="40" :x2="960" :y1="40 + n * 40" :y2="40 + n * 40" />
-            </g>
-            <path v-if="chart.forecastPath" :d="chart.forecastPath" class="line forecast" />
-            <path v-if="chart.actualPath" :d="chart.actualPath" class="line actual" />
-          </svg>
-          <div class="axis">
-            <span v-for="label in axisLabels" :key="label">{{ label }}</span>
-          </div>
+        <div class="chart-container">
+          <Line v-if="chartData" :data="chartData" :options="chartOptions" />
+          <div v-else class="loading-chart">Loading chart data...</div>
         </div>
       </section>
 
@@ -59,7 +51,7 @@
         <div class="panel-header">
           <div>
             <h2>Market Prices</h2>
-            <p>Polymarket CLOB (Yes price)</p>
+            <p>Polymarket CLOB (Yes/No prices).</p>
           </div>
           <span class="badge" :class="dashboard?.meta?.eventFound ? 'ok' : 'warn'">
             {{ dashboard?.meta?.eventFound ? "Event Found" : "Event Missing" }}
@@ -67,43 +59,27 @@
         </div>
         <div class="table market-table">
           <div class="row header">
-            <span>Outcome</span>
-            <span class="right">Price</span>
+            <span class="market-label">Outcome</span>
+            <span class="right">Yes</span>
+            <span class="right">No</span>
           </div>
-          <div v-for="outcome in marketOutcomes" :key="outcome.tokenId || outcome.title" class="row">
-            <span>{{ outcome.title || "—" }}</span>
-            <span class="right">{{ formatPrice(outcome.price) }}</span>
+          <div
+            v-for="outcome in marketOutcomes"
+            :key="outcomeKey(outcome)"
+            class="row market-row"
+            :class="{
+              locked: isNonTradable(outcome),
+              'match-high': isHighestMatch(outcome)
+            }"
+          >
+            <div class="outcome">
+              <span class="name">{{ outcome.title || "—" }}</span>
+            </div>
+            <span class="right price">{{ formatPrice(outcome.yesPrice ?? outcome.price) }}</span>
+            <span class="right price">{{ formatPrice(outcome.noPrice) }}</span>
           </div>
           <div v-if="marketOutcomes.length === 0" class="row empty">
             <span>No outcomes available</span>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h2>Portfolio</h2>
-            <p>CLOB collateral balance and positions</p>
-          </div>
-          <div class="balance">
-            <span>Balance</span>
-            <strong>{{ formatBalance(dashboard?.portfolio?.balance) }}</strong>
-          </div>
-        </div>
-        <div class="table positions-table">
-          <div class="row header">
-            <span>Market</span>
-            <span class="right">Size</span>
-            <span class="right">Avg</span>
-          </div>
-          <div v-for="pos in positions" :key="pos.key" class="row">
-            <span class="truncate">{{ pos.market }}</span>
-            <span class="right">{{ pos.size }}</span>
-            <span class="right">{{ pos.avg }}</span>
-          </div>
-          <div v-if="positions.length === 0" class="row empty">
-            <span>No positions</span>
           </div>
         </div>
       </section>
@@ -118,6 +94,28 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+} from 'chart.js';
+import type { ChartOptions, ChartData } from 'chart.js';
+import { Line } from 'vue-chartjs';
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+);
 
 type Dashboard = {
   meta: {
@@ -129,18 +127,37 @@ type Dashboard = {
   weather: {
     hourly: {
       times: string[];
-      forecast: Array<number | null>;
-      actual: Array<number | null>;
+      awc: Array<number | null>;
+      checkwx: Array<number | null>;
     };
     dayHigh: number | null;
+    sources?: {
+      awc: {
+        latest: number | null;
+        latestTime: string | null;
+        dayHigh: number | null;
+      };
+      checkwx: {
+        latest: number | null;
+        latestTime: string | null;
+        dayHigh: number | null;
+      };
+      match: boolean | null;
+      delta: number | null;
+    };
   };
   market: {
     eventTitle: string | null;
-    outcomes: Array<{ title: string | null; tokenId: string | null; price: number | null }>;
-  };
-  portfolio: {
-    balance: Record<string, unknown> | null;
-    positions: Array<Record<string, unknown>>;
+    outcomes: Array<{
+      title: string | null;
+      tokenId: string | null;
+      tokenYes?: string | null;
+      tokenNo?: string | null;
+      price: number | null;
+      yesPrice?: number | null;
+      noPrice?: number | null;
+      volume24hr?: number | null;
+    }>;
   };
 };
 
@@ -150,66 +167,110 @@ let timer: number | undefined;
 
 const marketOutcomes = computed(() => dashboard.value?.market?.outcomes ?? []);
 
-const positions = computed(() => {
-  const raw = dashboard.value?.portfolio?.positions ?? [];
-  return raw.slice(0, 6).map((pos, idx) => {
-    const market =
-      (pos as any)?.market?.title ||
-      (pos as any)?.market?.question ||
-      (pos as any)?.market?.slug ||
-      (pos as any)?.market ||
-      (pos as any)?.asset ||
-      "—";
-    const size = (pos as any)?.size ?? (pos as any)?.position_size ?? "—";
-    const avg = (pos as any)?.average_price ?? (pos as any)?.avg_price ?? "—";
-    return { key: `${market}-${idx}`, market, size, avg };
-  });
-});
+// --- Chart Data & Options ---
 
-const axisLabels = computed(() => ["00:00", "06:00", "12:00", "18:00", "24:00"]);
+const chartData = computed<ChartData<'line'> | null>(() => {
+  if (!dashboard.value) return null;
+  
+  const times = dashboard.value.weather.hourly.times || [];
+  const awc = dashboard.value.weather.hourly.awc || [];
+  const checkwx = dashboard.value.weather.hourly.checkwx || [];
 
-const chart = computed(() => {
-  const forecast = dashboard.value?.weather?.hourly?.forecast ?? [];
-  const actual = dashboard.value?.weather?.hourly?.actual ?? [];
-  const temps = [...forecast, ...actual].filter((v) => typeof v === "number") as number[];
-  if (temps.length === 0) {
-    return { forecastPath: "", actualPath: "" };
-  }
-  const min = Math.min(...temps) - 1;
-  const max = Math.max(...temps) + 1;
   return {
-    forecastPath: buildPath(forecast, min, max),
-    actualPath: buildPath(actual, min, max),
+    labels: times.map(t => formatHourLabel(t)),
+    datasets: [
+      {
+        label: 'AWC',
+        borderColor: '#1f7a8c', // var(--accent)
+        backgroundColor: '#1f7a8c',
+        data: awc,
+        tension: 0.1,
+        pointRadius: 3,
+        pointHoverRadius: 6
+      },
+      {
+        label: 'CheckWX',
+        borderColor: '#d08c2a', // var(--accent-2)
+        backgroundColor: '#d08c2a',
+        data: checkwx,
+        borderDash: [6, 4],
+        tension: 0.1,
+        pointRadius: 3,
+        pointHoverRadius: 6
+      }
+    ]
   };
 });
 
-const buildPath = (values: Array<number | null>, min: number, max: number) => {
-  const width = 1000;
-  const height = 260;
-  const padX = 40;
-  const padY = 20;
-  const step = values.length > 1 ? (width - padX * 2) / (values.length - 1) : 0;
-
-  const scaleY = (val: number) => {
-    if (max === min) return height / 2;
-    const pct = (max - val) / (max - min);
-    return padY + pct * (height - padY * 2);
-  };
-
-  let path = "";
-  let started = false;
-  values.forEach((val, index) => {
-    if (val === null || typeof val !== "number") {
-      started = false;
-      return;
+const chartOptions = computed<ChartOptions<'line'>>(() => {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        display: false // We use our custom legend
+      },
+      tooltip: {
+        backgroundColor: '#0f1b24',
+        titleFont: {
+          family: "'IBM Plex Mono', monospace",
+          size: 13
+        },
+        bodyFont: {
+          family: "'IBM Plex Mono', monospace",
+          size: 13
+        },
+        padding: 12,
+        cornerRadius: 8,
+        displayColors: false,
+        callbacks: {
+          label: (context) => {
+             let label = context.dataset.label || '';
+             if (label) {
+                 label += ': ';
+             }
+             if (context.parsed.y !== null) {
+                 label += context.parsed.y.toFixed(1) + '°C';
+             }
+             return label;
+          }
+        }
+      }
+    },
+    scales: {
+      x: {
+        grid: {
+          color: 'rgba(15, 27, 36, 0.05)'
+        },
+        ticks: {
+          color: '#5c6a73', // var(--muted)
+          font: {
+             family: "'IBM Plex Mono', monospace",
+             size: 14 // Increased size
+          },
+          maxRotation: 0,
+          autoSkip: true,
+          maxTicksLimit: 6
+        }
+      },
+      y: {
+        grid: {
+          color: 'rgba(15, 27, 36, 0.08)'
+        },
+        ticks: {
+          color: '#5c6a73',
+          font: {
+            family: "'IBM Plex Mono', monospace",
+             size: 14 // Increased size
+          },
+          callback: (value) => {
+            return typeof value === 'number' ? value.toFixed(1) + '°C' : value;
+          }
+        }
+      }
     }
-    const x = padX + index * step;
-    const y = scaleY(val);
-    path += `${started ? "L" : "M"} ${x.toFixed(2)} ${y.toFixed(2)} `;
-    started = true;
-  });
-  return path;
-};
+  };
+});
 
 const load = async () => {
   try {
@@ -236,33 +297,101 @@ const formatTemp = (val: number | null | undefined) => {
   return `${val.toFixed(1)}°C`;
 };
 
+const formatDelta = (val: number | null | undefined) => {
+  if (val === null || val === undefined) return "—";
+  const sign = val > 0 ? "+" : "";
+  return `${sign}${val.toFixed(2)}°C`;
+};
+
 const formatPrice = (val: number | null | undefined) => {
   if (val === null || val === undefined) return "—";
   return val.toFixed(3);
-};
-
-const formatBalance = (balance: Record<string, unknown> | null | undefined) => {
-  if (!balance) return "—";
-  const candidateKeys = ["balance", "available", "collateral", "amount", "collateralBalance"];
-  for (const key of candidateKeys) {
-    const value = (balance as any)[key];
-    if (typeof value === "number") return value.toFixed(2);
-    if (typeof value === "string") return value;
-  }
-  if (Array.isArray(balance) && balance.length > 0) {
-    const first = balance[0] as any;
-    if (typeof first?.balance === "string") return first.balance;
-  }
-  return "—";
 };
 
 const formatTime = (ts: string | undefined) => {
   if (!ts) return "—";
   try {
     const dt = new Date(ts);
-    return dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+    return dt.toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "Asia/Seoul",
+    });
   } catch {
     return "—";
   }
+};
+
+const formatHourLabel = (ts: string) => {
+  try {
+    const dt = new Date(ts);
+    return dt.toLocaleTimeString("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+      timeZone: "Asia/Seoul",
+    });
+  } catch {
+    return "--:--";
+  }
+};
+
+const outcomeKey = (outcome: {
+  tokenId: string | null;
+  title: string | null;
+}) => outcome.tokenId || outcome.title || "—";
+
+const matchesOutcome = (
+  title: string | null | undefined,
+  value: number
+): boolean => {
+  if (!title) return false;
+  const text = title.toLowerCase();
+  const match = text.match(/(-?\d+)\s*°?\s*c/);
+  if (!match) return false;
+  const numeric = Number.parseInt(match[1], 10);
+  if (Number.isNaN(numeric)) return false;
+  if (text.includes("or below") || text.includes("or lower")) {
+    return value <= numeric;
+  }
+  if (text.includes("or higher") || text.includes("or above")) {
+    return value >= numeric;
+  }
+  return value === numeric;
+};
+
+const highestOutcomeKey = computed(() => {
+  const dayHigh = dashboard.value?.weather?.dayHigh;
+  if (typeof dayHigh !== "number") return null;
+  const target = Math.round(dayHigh);
+  for (const outcome of marketOutcomes.value) {
+    if (matchesOutcome(outcome.title, target)) {
+      return outcomeKey(outcome);
+    }
+  }
+  return null;
+});
+
+const sourceMatch = computed(() => {
+  const match = dashboard.value?.weather?.sources?.match;
+  return typeof match === "boolean" ? match : null;
+});
+
+const sourceDelta = computed(
+  () => dashboard.value?.weather?.sources?.delta ?? null
+);
+
+const isHighestMatch = (outcome: { tokenId: string | null; title: string | null }) =>
+  outcomeKey(outcome) === highestOutcomeKey.value;
+
+const isNonTradable = (outcome: { price: number | null; yesPrice?: number | null }) => {
+  const price =
+    typeof outcome.yesPrice === "number"
+      ? outcome.yesPrice
+      : typeof outcome.price === "number"
+      ? outcome.price
+      : null;
+  if (price === null) return false;
+  return price <= 0.001;
 };
 </script>

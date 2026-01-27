@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -17,8 +17,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 SEOUL_TZ = ZoneInfo(os.getenv("SEOUL_TIMEZONE", "Asia/Seoul"))
-RKSI_LAT = float(os.getenv("RKSI_LAT", "37.469"))
-RKSI_LON = float(os.getenv("RKSI_LON", "126.451"))
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "30"))
 MARKET_SLUG_PREFIX = os.getenv(
     "MARKET_SLUG_PREFIX", "highest-temperature-in-seoul-on"
@@ -36,6 +34,10 @@ POLY_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "").strip()
 POLY_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
 POLY_SIGNATURE_TYPE = os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
 POLY_FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "").strip()
+
+CHECK_WX_API_KEY = os.getenv("CHECK_WX_API_KEY", "").strip()
+CHECK_WX_HOST = os.getenv("CHECK_WX_HOST", "https://api.checkwx.com")
+CHECK_WX_TTL = int(os.getenv("CHECK_WX_TTL_SECONDS", str(CACHE_TTL)))
 
 app = FastAPI()
 
@@ -76,7 +78,10 @@ def _build_slug(local_date: datetime.date) -> str:
 def _parse_iso(ts: str) -> datetime:
     if ts.endswith("Z"):
         ts = ts.replace("Z", "+00:00")
-    return datetime.fromisoformat(ts)
+    parsed = datetime.fromisoformat(ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 async def _cached(key: str, fetcher, ttl: int = CACHE_TTL):
@@ -89,25 +94,56 @@ async def _cached(key: str, fetcher, ttl: int = CACHE_TTL):
     return data
 
 
-async def _fetch_forecast() -> Dict[str, Any]:
-    assert _http_client
-    params = {
-        "latitude": RKSI_LAT,
-        "longitude": RKSI_LON,
-        "hourly": "temperature_2m",
-        "timezone": "Asia/Seoul",
-    }
-    resp = await _http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _fetch_metar() -> List[Dict[str, Any]]:
+async def _fetch_metar_aviation_weather() -> List[Dict[str, Any]]:
     assert _http_client
     params = {"ids": "RKSI", "format": "json", "hours": "24"}
     resp = await _http_client.get("https://aviationweather.gov/api/data/metar", params=params)
     resp.raise_for_status()
     return resp.json()
+
+
+async def _fetch_metar_checkwx() -> List[Dict[str, Any]]:
+    if not CHECK_WX_API_KEY:
+        return []
+    assert _http_client
+    headers = {"X-API-Key": CHECK_WX_API_KEY}
+    resp = await _http_client.get(f"{CHECK_WX_HOST}/metar/RKSI/decoded", headers=headers)
+    if resp.status_code != 200:
+        return []
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        observed = entry.get("observed")
+        temperature = entry.get("temperature")
+        temp_c = None
+        if isinstance(temperature, dict):
+            temp_c = temperature.get("celsius")
+        temp_c = _coerce_float(temp_c)
+        if observed is None or temp_c is None:
+            continue
+        normalized.append({"reportTime": observed, "temp": temp_c})
+    return normalized
+
+
+async def _fetch_metar() -> Dict[str, List[Dict[str, Any]]]:
+    try:
+        awc = await _cached("metar:awc", _fetch_metar_aviation_weather)
+    except Exception:
+        awc = []
+    try:
+        checkwx = await _cached(
+            "metar:checkwx", _fetch_metar_checkwx, ttl=CHECK_WX_TTL
+        )
+    except Exception:
+        checkwx = []
+    return {"awc": awc or [], "checkwx": checkwx or []}
 
 
 async def _fetch_event(slug: str) -> Optional[Dict[str, Any]]:
@@ -141,36 +177,55 @@ async def _fetch_price(token_id: str) -> Optional[float]:
         return None
 
 
-def _build_hourly_axis(local_date: datetime.date) -> List[datetime]:
+def _build_time_axis(local_date: datetime.date, minutes_step: int = 30) -> List[datetime]:
     start = datetime.combine(local_date, datetime.min.time()).replace(tzinfo=SEOUL_TZ)
-    return [start + timedelta(hours=i) for i in range(24)]
+    total_minutes = 24 * 60
+    steps = total_minutes // minutes_step
+    return [start + timedelta(minutes=i * minutes_step) for i in range(steps)]
 
 
-def _forecast_for_date(forecast: Dict[str, Any], local_date: datetime.date) -> List[Optional[float]]:
-    times = forecast.get("hourly", {}).get("time", [])
-    temps = forecast.get("hourly", {}).get("temperature_2m", [])
-    hourly_map: Dict[str, float] = {}
-    for t, temp in zip(times, temps):
+def _coerce_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
         try:
-            dt = datetime.fromisoformat(t)
-        except ValueError:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=SEOUL_TZ)
-        if dt.date() != local_date:
-            continue
-        key = dt.strftime("%Y-%m-%dT%H:00")
-        hourly_map[key] = temp
-
-    hourly_axis = _build_hourly_axis(local_date)
-    out: List[Optional[float]] = []
-    for dt in hourly_axis:
-        key = dt.strftime("%Y-%m-%dT%H:00")
-        out.append(hourly_map.get(key))
-    return out
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
-def _actuals_for_date(metar: List[Dict[str, Any]], local_date: datetime.date) -> Dict[str, Any]:
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_tokens(market: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    token_ids = _coerce_list(market.get("clobTokenIds"))
+    outcomes = _coerce_list(market.get("outcomes"))
+    tokens: Dict[str, Optional[str]] = {"yes": None, "no": None}
+    if outcomes and token_ids:
+        for idx, outcome in enumerate(outcomes):
+            if idx >= len(token_ids) or not isinstance(outcome, str):
+                continue
+            label = outcome.strip().lower()
+            if label == "yes":
+                tokens["yes"] = token_ids[idx]
+            elif label == "no":
+                tokens["no"] = token_ids[idx]
+    if tokens["yes"] is None and token_ids:
+        tokens["yes"] = token_ids[0]
+    if tokens["no"] is None and len(token_ids) > 1:
+        tokens["no"] = token_ids[1]
+    return tokens
+
+
+def _actuals_for_date(
+    metar: List[Dict[str, Any]], local_date: datetime.date, now_kst: datetime
+) -> Dict[str, Any]:
     readings: List[tuple[datetime, float]] = []
     for obs in metar:
         report_time = obs.get("reportTime") or obs.get("receiptTime")
@@ -182,30 +237,47 @@ def _actuals_for_date(metar: List[Dict[str, Any]], local_date: datetime.date) ->
         except ValueError:
             continue
         dt_local = dt_utc.astimezone(SEOUL_TZ)
+        if dt_local.date() != local_date:
+            continue
         readings.append((dt_local, float(temp)))
 
     readings.sort(key=lambda r: r[0])
-    hourly_axis = _build_hourly_axis(local_date)
+    hourly_axis = _build_time_axis(local_date, minutes_step=30)
 
     hourly: List[Optional[float]] = []
     latest: Optional[float] = None
     idx = 0
     for hour_dt in hourly_axis:
+        if hour_dt > now_kst:
+            hourly.append(None)
+            continue
         while idx < len(readings) and readings[idx][0] <= hour_dt:
             latest = readings[idx][1]
             idx += 1
         hourly.append(latest)
 
-    day_temps = [temp for dt, temp in readings if dt.date() == local_date]
+    day_temps = [temp for dt, temp in readings if dt <= now_kst]
     day_high = max(day_temps) if day_temps else None
 
     return {"hourly": hourly, "day_high": day_high}
 
 
+def _latest_hour_index(values: List[Optional[float]]) -> Optional[int]:
+    for idx in range(len(values) - 1, -1, -1):
+        if isinstance(values[idx], (int, float)):
+            return idx
+    return None
+
+
+def _max_optional(values: List[Optional[float]]) -> Optional[float]:
+    present = [val for val in values if isinstance(val, (int, float))]
+    return max(present) if present else None
+
+
 def _format_axis_times(local_date: datetime.date) -> List[str]:
     return [
         dt.astimezone(SEOUL_TZ).isoformat()
-        for dt in _build_hourly_axis(local_date)
+        for dt in _build_time_axis(local_date, minutes_step=30)
     ]
 
 
@@ -258,8 +330,13 @@ async def dashboard() -> Dict[str, Any]:
     local_date = now_kst.date()
     slug = _build_slug(local_date)
 
-    forecast = await _cached("forecast", _fetch_forecast)
     metar = await _cached("metar", _fetch_metar)
+    if isinstance(metar, dict):
+        metar_awc = metar.get("awc", []) or []
+        metar_checkwx = metar.get("checkwx", []) or []
+    else:
+        metar_awc = []
+        metar_checkwx = []
 
     event = await _cached(f"event:{slug}", lambda: _fetch_event(slug))
 
@@ -267,27 +344,69 @@ async def dashboard() -> Dict[str, Any]:
     if event and isinstance(event, dict):
         markets = event.get("markets", [])
         for market in markets:
-            token_ids = market.get("clobTokenIds")
-            if isinstance(token_ids, str):
-                try:
-                    token_ids = json.loads(token_ids)
-                except json.JSONDecodeError:
-                    token_ids = []
-            token_yes = token_ids[0] if token_ids else None
-            price = None
+            tokens = _select_tokens(market)
+            token_yes = tokens.get("yes")
+            token_no = tokens.get("no")
+            yes_price = None
+            no_price = None
             if token_yes:
-                price = await _cached(
+                yes_price = await _cached(
                     f"price:{token_yes}", lambda: _fetch_price(token_yes)
                 )
+            if token_no:
+                no_price = await _cached(
+                    f"price:{token_no}", lambda: _fetch_price(token_no)
+                )
+            if yes_price is None or yes_price <= 0:
+                yes_price = _coerce_float(market.get("bestAsk")) or _coerce_float(
+                    market.get("lastTradePrice")
+                ) or yes_price
+            if no_price is not None and no_price <= 0:
+                no_price = None
             outcomes.append(
                 {
                     "title": market.get("groupItemTitle") or market.get("question"),
                     "tokenId": token_yes,
-                    "price": price,
+                    "tokenYes": token_yes,
+                    "tokenNo": token_no,
+                    "price": yes_price,
+                    "yesPrice": yes_price,
+                    "noPrice": no_price,
+                    "volume24hr": _coerce_float(market.get("volume24hr"))
+                    or _coerce_float(market.get("volume24hrClob")),
                 }
             )
 
-    weather_actuals = _actuals_for_date(metar, local_date)
+    awc_actuals = _actuals_for_date(metar_awc, local_date, now_kst)
+    checkwx_actuals = _actuals_for_date(metar_checkwx, local_date, now_kst)
+    axis_times = _format_axis_times(local_date)
+
+    awc_latest_idx = _latest_hour_index(awc_actuals["hourly"])
+    checkwx_latest_idx = _latest_hour_index(checkwx_actuals["hourly"])
+    awc_latest = (
+        awc_actuals["hourly"][awc_latest_idx]
+        if awc_latest_idx is not None
+        else None
+    )
+    checkwx_latest = (
+        checkwx_actuals["hourly"][checkwx_latest_idx]
+        if checkwx_latest_idx is not None
+        else None
+    )
+    awc_latest_time = (
+        axis_times[awc_latest_idx] if awc_latest_idx is not None else None
+    )
+    checkwx_latest_time = (
+        axis_times[checkwx_latest_idx] if checkwx_latest_idx is not None else None
+    )
+
+    delta = None
+    match = None
+    if isinstance(awc_latest, (int, float)) and isinstance(checkwx_latest, (int, float)):
+        delta = round(checkwx_latest - awc_latest, 2)
+        match = abs(delta) < 0.05
+
+    day_high = _max_optional([awc_actuals["day_high"], checkwx_actuals["day_high"]])
 
     balance = await _cached("balance", _get_clob_balance)
     positions = await _cached("positions", _get_positions)
@@ -301,11 +420,25 @@ async def dashboard() -> Dict[str, Any]:
         },
         "weather": {
             "hourly": {
-                "times": _format_axis_times(local_date),
-                "forecast": _forecast_for_date(forecast, local_date),
-                "actual": weather_actuals["hourly"],
+                "times": axis_times,
+                "awc": awc_actuals["hourly"],
+                "checkwx": checkwx_actuals["hourly"],
             },
-            "dayHigh": weather_actuals["day_high"],
+            "dayHigh": day_high,
+            "sources": {
+                "awc": {
+                    "latest": awc_latest,
+                    "latestTime": awc_latest_time,
+                    "dayHigh": awc_actuals["day_high"],
+                },
+                "checkwx": {
+                    "latest": checkwx_latest,
+                    "latestTime": checkwx_latest_time,
+                    "dayHigh": checkwx_actuals["day_high"],
+                },
+                "match": match,
+                "delta": delta,
+            },
         },
         "market": {
             "eventTitle": event.get("title") if event else None,
