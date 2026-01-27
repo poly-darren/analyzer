@@ -87,7 +87,26 @@
 
     <footer class="footer">
       <span>Polling every 30s · Data cached server-side</span>
-      <span v-if="error" class="error">{{ error }}</span>
+      <div class="footer-right">
+        <button
+          class="ghost-button"
+          :class="{ active: soundEnabled }"
+          type="button"
+          @click="toggleSound"
+        >
+          {{ soundEnabled ? "Sound on" : "Enable sound" }}
+        </button>
+        <button
+          v-if="enableNotifyTest"
+          class="ghost-button"
+          type="button"
+          @click="triggerTestNotification"
+        >
+          Test notification
+        </button>
+        <span v-if="highNotice" class="notice">{{ highNotice }}</span>
+        <span v-if="error" class="error">{{ error }}</span>
+      </div>
     </footer>
   </div>
 </template>
@@ -163,7 +182,18 @@ type Dashboard = {
 
 const dashboard = ref<Dashboard | null>(null);
 const error = ref<string | null>(null);
+const highNotice = ref<string | null>(null);
+const enableNotifyTest = ref(false);
+const soundEnabled = ref(false);
 let timer: number | undefined;
+let noticeTimer: number | undefined;
+let notifyStateLoaded = false;
+let lastNotifiedDate: string | null = null;
+let lastNotifiedHigh: number | null = null;
+const NOTIFY_STORAGE_KEY = "dayHighNotification";
+let audioContext: AudioContext | null = null;
+let soundUnlockHandler: (() => void) | null = null;
+const SOUND_STORAGE_KEY = "dayHighSoundEnabled";
 
 const marketOutcomes = computed(() => dashboard.value?.market?.outcomes ?? []);
 
@@ -276,7 +306,9 @@ const load = async () => {
   try {
     const res = await fetch("/api/dashboard");
     if (!res.ok) throw new Error(`API ${res.status}`);
-    dashboard.value = await res.json();
+    const data = await res.json();
+    maybeNotifyNewHigh(data);
+    dashboard.value = data;
     error.value = null;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "Failed to load";
@@ -286,10 +318,23 @@ const load = async () => {
 onMounted(() => {
   load();
   timer = window.setInterval(load, 30000);
+  loadSoundPreference();
+  if (typeof window !== "undefined") {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("notify") === "button") {
+      enableNotifyTest.value = true;
+    }
+  }
 });
 
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer);
+  if (noticeTimer) window.clearInterval(noticeTimer);
+  if (soundUnlockHandler) {
+    window.removeEventListener("click", soundUnlockHandler);
+    window.removeEventListener("keydown", soundUnlockHandler);
+    soundUnlockHandler = null;
+  }
 });
 
 const formatTemp = (val: number | null | undefined) => {
@@ -306,6 +351,189 @@ const formatDelta = (val: number | null | undefined) => {
 const formatPrice = (val: number | null | undefined) => {
   if (val === null || val === undefined) return "—";
   return val.toFixed(3);
+};
+
+const showHighNotice = (message: string) => {
+  highNotice.value = message;
+  if (noticeTimer) window.clearTimeout(noticeTimer);
+  noticeTimer = window.setTimeout(() => {
+    highNotice.value = null;
+  }, 12000);
+};
+
+const setupSoundUnlock = () => {
+  if (typeof window === "undefined" || soundUnlockHandler) return;
+  soundUnlockHandler = async () => {
+    await ensureAudioContext();
+    if (soundUnlockHandler) {
+      window.removeEventListener("click", soundUnlockHandler);
+      window.removeEventListener("keydown", soundUnlockHandler);
+      soundUnlockHandler = null;
+    }
+  };
+  window.addEventListener("click", soundUnlockHandler, { once: true });
+  window.addEventListener("keydown", soundUnlockHandler, { once: true });
+};
+
+const ensureAudioContext = async (): Promise<AudioContext | null> => {
+  if (typeof window === "undefined") return null;
+  const AudioCtor = window.AudioContext || (window as typeof window & {
+    webkitAudioContext?: typeof AudioContext;
+  }).webkitAudioContext;
+  if (!AudioCtor) return null;
+  if (!audioContext) {
+    audioContext = new AudioCtor();
+  }
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
+  }
+  return audioContext;
+};
+
+const playBeep = () => {
+  if (!audioContext || audioContext.state !== "running") return;
+  const osc = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  osc.type = "sine";
+  osc.frequency.value = 880;
+  const now = audioContext.currentTime;
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+  osc.connect(gain);
+  gain.connect(audioContext.destination);
+  osc.start(now);
+  osc.stop(now + 0.13);
+};
+
+const loadSoundPreference = () => {
+  if (typeof window === "undefined") return;
+  try {
+    const raw = window.localStorage.getItem(SOUND_STORAGE_KEY);
+    if (raw === "true") {
+      soundEnabled.value = true;
+      setupSoundUnlock();
+    }
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const persistSoundPreference = () => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      SOUND_STORAGE_KEY,
+      soundEnabled.value ? "true" : "false"
+    );
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const toggleSound = async () => {
+  if (soundEnabled.value) {
+    soundEnabled.value = false;
+    persistSoundPreference();
+    if (audioContext && audioContext.state === "running") {
+      await audioContext.suspend();
+    }
+    return;
+  }
+  const ctx = await ensureAudioContext();
+  if (!ctx || ctx.state !== "running") {
+    showHighNotice("Sound blocked — click again");
+    return;
+  }
+  soundEnabled.value = true;
+  persistSoundPreference();
+  playBeep();
+};
+
+const loadNotifyState = () => {
+  if (notifyStateLoaded || typeof window === "undefined") return;
+  notifyStateLoaded = true;
+  try {
+    const raw = window.localStorage.getItem(NOTIFY_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const date = typeof parsed.date === "string" ? parsed.date : null;
+      const value = typeof parsed.value === "number" ? parsed.value : null;
+      lastNotifiedDate = date;
+      lastNotifiedHigh = value;
+    }
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const persistNotifyState = () => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      NOTIFY_STORAGE_KEY,
+      JSON.stringify({ date: lastNotifiedDate, value: lastNotifiedHigh })
+    );
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const notifyBrowser = (message: string) => {
+  if (typeof window === "undefined") return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "granted") {
+    new Notification("New day high", { body: message, tag: "day-high" });
+    return;
+  }
+  if (Notification.permission === "default") {
+    Notification.requestPermission().then((permission) => {
+      if (permission === "granted") {
+        new Notification("New day high", { body: message, tag: "day-high" });
+      }
+    });
+  }
+};
+
+const triggerTestNotification = () => {
+  const message = "Test notification: new day high";
+  showHighNotice(message);
+  notifyBrowser(message);
+  if (soundEnabled.value) {
+    playBeep();
+  }
+};
+
+const maybeNotifyNewHigh = (next: Dashboard) => {
+  loadNotifyState();
+  const dayHigh = next?.weather?.dayHigh;
+  const kstDate = next?.meta?.kstDate;
+  if (typeof dayHigh !== "number" || !kstDate) return;
+
+  if (lastNotifiedDate !== kstDate) {
+    lastNotifiedDate = kstDate;
+    lastNotifiedHigh = dayHigh;
+    persistNotifyState();
+    return;
+  }
+
+  if (lastNotifiedHigh === null) {
+    lastNotifiedHigh = dayHigh;
+    persistNotifyState();
+    return;
+  }
+
+  if (dayHigh > lastNotifiedHigh + 1e-6) {
+    const message = `New day high: ${formatTemp(dayHigh)} (KST)`;
+    showHighNotice(message);
+    notifyBrowser(message);
+    if (soundEnabled.value) {
+      playBeep();
+    }
+    lastNotifiedHigh = dayHigh;
+    persistNotifyState();
+  }
 };
 
 const formatTime = (ts: string | undefined) => {
