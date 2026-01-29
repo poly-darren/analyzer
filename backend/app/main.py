@@ -465,6 +465,27 @@ def _actuals_for_date(
     return {"hourly": hourly, "day_high": day_high}
 
 
+def _latest_observed_at_for_date(
+    metar: List[Dict[str, Any]], local_date: datetime.date, now_kst: datetime
+) -> Optional[str]:
+    latest_dt: Optional[datetime] = None
+    for obs in metar:
+        report_time = obs.get("reportTime") or obs.get("receiptTime")
+        temp = obs.get("temp")
+        if not isinstance(report_time, str) or temp is None:
+            continue
+        try:
+            dt_utc = _parse_iso(report_time)
+        except ValueError:
+            continue
+        dt_local = dt_utc.astimezone(SEOUL_TZ).replace(second=0, microsecond=0)
+        if dt_local.date() != local_date or dt_local > now_kst:
+            continue
+        if latest_dt is None or dt_local > latest_dt:
+            latest_dt = dt_local
+    return latest_dt.isoformat() if latest_dt else None
+
+
 def _latest_hour_index(values: List[Optional[float]]) -> Optional[int]:
     for idx in range(len(values) - 1, -1, -1):
         if isinstance(values[idx], (int, float)):
@@ -1217,15 +1238,29 @@ async def dashboard() -> Dict[str, Any]:
         axis_times[checkwx_latest_idx] if checkwx_latest_idx is not None else None
     )
 
+    awc_latest_observed_at = _latest_observed_at_for_date(metar_awc, local_date, now_kst)
+    checkwx_latest_observed_at = _latest_observed_at_for_date(
+        metar_checkwx, local_date, now_kst
+    )
+
     delta = None
     match = None
-    compare_idx = _latest_common_hour_index(awc_actuals["hourly"], checkwx_actuals["hourly"])
-    if compare_idx is not None:
-        awc_compare = awc_actuals["hourly"][compare_idx]
-        checkwx_compare = checkwx_actuals["hourly"][compare_idx]
-        if isinstance(awc_compare, (int, float)) and isinstance(checkwx_compare, (int, float)):
-            delta = round(checkwx_compare - awc_compare, 2)
-            match = abs(delta) < 0.05
+    if (
+        awc_latest_observed_at
+        and checkwx_latest_observed_at
+        and awc_latest_observed_at == checkwx_latest_observed_at
+    ):
+        compare_idx = _latest_common_hour_index(
+            awc_actuals["hourly"], checkwx_actuals["hourly"]
+        )
+        if compare_idx is not None:
+            awc_compare = awc_actuals["hourly"][compare_idx]
+            checkwx_compare = checkwx_actuals["hourly"][compare_idx]
+            if isinstance(awc_compare, (int, float)) and isinstance(
+                checkwx_compare, (int, float)
+            ):
+                delta = round(checkwx_compare - awc_compare, 2)
+                match = abs(delta) < 0.05
 
     day_high = _max_optional([awc_actuals["day_high"], checkwx_actuals["day_high"]])
 
@@ -1248,11 +1283,13 @@ async def dashboard() -> Dict[str, Any]:
                 "awc": {
                     "latest": awc_latest,
                     "latestTime": awc_latest_time,
+                    "latestObservedAt": awc_latest_observed_at,
                     "dayHigh": awc_actuals["day_high"],
                 },
                 "checkwx": {
                     "latest": checkwx_latest,
                     "latestTime": checkwx_latest_time,
+                    "latestObservedAt": checkwx_latest_observed_at,
                     "dayHigh": checkwx_actuals["day_high"],
                 },
                 "match": match,
