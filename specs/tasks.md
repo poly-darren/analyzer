@@ -3,7 +3,7 @@
 This file tracks implementation work derived from `specs/v2.md`.
 
 Related docs:
-- `specs/supabase.md` (Supabase project + schema setup)
+- `supabase/` (Supabase local config + schema/migrations)
 
 ## P0 — Persistence + Ingestion (v2 scope)
 - [x] Add Supabase writer (PostgREST via `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, or direct Postgres via `SUPABASE_DB_URL`) gated by `SUPABASE_WRITE_ENABLED`.

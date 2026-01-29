@@ -30,6 +30,16 @@ Bid every day on the event:
 - Prefer using web.run to fetch the latest Wunderground data when needed.
 - Keep records of daily bids and rationale when appropriate.
 
+## Database (Supabase)
+- This project uses Supabase (Postgres + PostgREST) for persistence and analytics.
+- Schema/migrations live in `supabase/migrations`.
+- Backend writes are gated by `SUPABASE_WRITE_ENABLED=1` plus `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `backend/.env`.
+- For local dev, run Supabase locally (Docker required): `bunx -y supabase start --yes` / `bunx -y supabase stop --yes` (ports/config in `supabase/config.toml`).
+
+## Local Development
+- Run everything: `make dev` (backend `:8000`, frontend `:5173`).
+- Backend only: `make dev-backend`; frontend only: `make dev-frontend`.
+
 ## Browser Automation
 - Use `agent-browser` to test your own changes in a real browser.
 - Run `agent-browser --help` to see available commands.
