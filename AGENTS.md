@@ -19,6 +19,9 @@ Bid every day on the event:
 - Use the finalized highest temperature for the date.
 - Ensure units are Celsius.
 
+## Station Coordinates
+- Incheon International Airport (ICN / RKSI): `37.4639° N, 126.4456° E` (approx; `37°27′50″N 126°26′44″E`)
+
 ## Trading Mindset
 - Think like a pro trader: quantify uncertainty, watch forecast vs. historical distributions, and size bids accordingly.
 - Always verify the latest data before placing or updating bids.
@@ -26,6 +29,21 @@ Bid every day on the event:
 ## Execution Notes
 - Prefer using web.run to fetch the latest Wunderground data when needed.
 - Keep records of daily bids and rationale when appropriate.
+
+## Browser Automation
+- Use `agent-browser` to test your own changes in a real browser.
+- Run `agent-browser --help` to see available commands.
+- Core workflow:
+  1. `agent-browser open <url>` — navigate to page
+  2. `agent-browser snapshot -i` — list interactive elements with refs (@e1, @e2)
+  3. `agent-browser click @e1` / `agent-browser fill @e2 "text"` — interact using refs
+  4. Re-run `snapshot -i` after page changes
+
+## JS Tooling
+- Always use `bun` (not `npm`) for Node/JS/TS workflows.
+- Use `bun install` instead of `npm install`.
+- Use `bunx -y ...` instead of `npx ...`.
+- Use `bun run <script>` instead of `npm run <script>`.
 
 ## Auth Notes
 - Google/Magic login uses a proxy wallet: signature type `1` and funder address should be the proxy wallet address shown on Polymarket.
