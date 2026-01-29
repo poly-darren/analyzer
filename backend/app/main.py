@@ -1,15 +1,18 @@
 import asyncio
+import html
 import json
+import math
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from bisect import bisect_left, bisect_right
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
@@ -29,6 +32,7 @@ AWC_TTL = int(os.getenv("AWC_TTL_SECONDS", "60"))
 EVENT_TTL = int(os.getenv("EVENT_TTL_SECONDS", "900"))
 PORTFOLIO_TTL = int(os.getenv("PORTFOLIO_TTL_SECONDS", "900"))
 FORECAST_TTL = int(os.getenv("FORECAST_TTL_SECONDS", "3600"))
+WU_TTL = int(os.getenv("WU_TTL_SECONDS", "300"))
 INGESTION_ENABLED = os.getenv("INGESTION_ENABLED", "1").strip().lower() in (
     "1",
     "true",
@@ -75,9 +79,7 @@ POLY_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
 POLY_SIGNATURE_TYPE = os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
 POLY_FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "").strip()
 
-CHECK_WX_API_KEY = os.getenv("CHECK_WX_API_KEY", "").strip()
-CHECK_WX_HOST = os.getenv("CHECK_WX_HOST", "https://api.checkwx.com")
-CHECK_WX_TTL = int(os.getenv("CHECK_WX_TTL_SECONDS", "900"))
+WU_HISTORY_HOST = os.getenv("WU_HISTORY_HOST", "https://www.wunderground.com").rstrip("/")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -106,7 +108,7 @@ _ingestion_tasks: List["asyncio.Task[None]"] = []
 _state_lock = asyncio.Lock()
 _health: Dict[str, Dict[str, Optional[str]]] = {
     "awc": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
-    "checkwx": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
+    "wunderground": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
     "event": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
     "market": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
     "forecast": {"lastSuccessAt": None, "lastError": None, "lastErrorAt": None},
@@ -120,7 +122,11 @@ _latest_market_outcomes: List[Dict[str, Any]] = []
 _latest_market_state: List[Dict[str, Any]] = []
 
 _latest_metar_awc: List[Dict[str, Any]] = []
-_latest_metar_checkwx: List[Dict[str, Any]] = []
+
+_latest_wu_history: Optional[Dict[str, Any]] = None
+_wu_observed_max_by_date: Dict[str, float] = {}
+_wu_observed_max_whole_by_date: Dict[str, int] = {}
+_wu_observed_max_loaded: set[str] = set()
 
 _latest_forecast: Optional[Dict[str, Any]] = None
 _latest_forecast_fetched_ts: Optional[float] = None
@@ -145,7 +151,7 @@ async def on_startup() -> None:
         _ingestion_tasks = [
             asyncio.create_task(_ingest_market_loop()),
             asyncio.create_task(_ingest_awc_loop()),
-            asyncio.create_task(_ingest_checkwx_loop()),
+            asyncio.create_task(_ingest_wunderground_loop()),
             asyncio.create_task(_ingest_forecast_loop()),
             asyncio.create_task(_ingest_portfolio_loop()),
         ]
@@ -182,6 +188,107 @@ def _parse_iso(ts: str) -> datetime:
     return parsed
 
 
+def _parse_date_kst(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid date_kst; use YYYY-MM-DD") from exc
+
+
+def _parse_time_hhmm(value: str) -> tuple[dt_time, bool]:
+    if value == "24:00":
+        return dt_time(0, 0), True
+    try:
+        return dt_time.fromisoformat(value), False
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid time; use HH:MM") from exc
+
+
+def _kst_datetime(day: date, hhmm: str) -> datetime:
+    parsed, is_next_day = _parse_time_hhmm(hhmm)
+    base = datetime.combine(day, parsed, tzinfo=SEOUL_TZ)
+    return base + timedelta(days=1) if is_next_day else base
+
+
+def _format_kst_hhmm(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(SEOUL_TZ).strftime("%H:%M")
+
+
+def _require_supabase() -> SupabaseWriter:
+    if not _supabase or not _supabase.enabled():
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    return _supabase
+
+
+def _market_matches_bucket(
+    lower: Optional[int], upper: Optional[int], target: int
+) -> bool:
+    if lower is None and upper is None:
+        return False
+    if lower is None:
+        return target <= upper  # type: ignore[operator]
+    if upper is None:
+        return target >= lower
+    return lower <= target <= upper
+
+
+def _sorted_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(row: Dict[str, Any]) -> tuple[int, int]:
+        threshold = row.get("group_item_threshold")
+        if isinstance(threshold, int):
+            return (0, threshold)
+        return (1, 0)
+
+    return sorted(markets, key=sort_key)
+
+
+def _resample_to_anchors(
+    snapshots: List[Dict[str, Any]],
+    anchors_utc: List[datetime],
+    *,
+    mode: str = "closest",
+) -> List[Dict[str, Any]]:
+    if not snapshots:
+        return []
+    parsed: List[tuple[datetime, Dict[str, Any]]] = []
+    for row in snapshots:
+        captured_at = row.get("captured_at")
+        if not isinstance(captured_at, str):
+            continue
+        try:
+            parsed_dt = _parse_iso(captured_at)
+        except ValueError:
+            continue
+        parsed.append((parsed_dt, row))
+
+    parsed.sort(key=lambda item: item[0])
+    times = [item[0] for item in parsed]
+
+    out: List[Dict[str, Any]] = []
+    for anchor in anchors_utc:
+        chosen: Optional[Dict[str, Any]] = None
+        if mode == "carry":
+            idx = bisect_right(times, anchor) - 1
+            if idx >= 0:
+                chosen = parsed[idx][1]
+        else:
+            idx = bisect_left(times, anchor)
+            candidates: List[tuple[datetime, Dict[str, Any]]] = []
+            if 0 <= idx < len(parsed):
+                candidates.append(parsed[idx])
+            if idx - 1 >= 0:
+                candidates.append(parsed[idx - 1])
+            if candidates:
+                chosen = min(
+                    candidates, key=lambda item: abs((item[0] - anchor).total_seconds())
+                )[1]
+        if chosen:
+            out.append(chosen)
+        else:
+            out.append({})
+    return out
+
+
 def _coerce_int(value: Any) -> Optional[int]:
     try:
         return int(value)
@@ -214,34 +321,403 @@ async def _fetch_metar_aviation_weather() -> List[Dict[str, Any]]:
     return resp.json()
 
 
-async def _fetch_metar_checkwx() -> List[Dict[str, Any]]:
-    if not CHECK_WX_API_KEY:
-        return []
+def _build_wu_history_url(local_date: datetime.date) -> str:
+    return (
+        f"{WU_HISTORY_HOST}/history/daily/kr/incheon/RKSI/date/"
+        f"{local_date.year}-{local_date.month}-{local_date.day}"
+    )
+
+
+async def _fetch_wu_history_html(url: str) -> str:
     assert _http_client
-    headers = {"X-API-Key": CHECK_WX_API_KEY}
-    resp = await _http_client.get(f"{CHECK_WX_HOST}/metar/RKSI/decoded", headers=headers)
-    if resp.status_code != 200:
-        return []
-    payload = resp.json()
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    if not isinstance(data, list):
-        return []
-    normalized: List[Dict[str, Any]] = []
-    for entry in data:
-        if not isinstance(entry, dict):
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "referer": f"{WU_HISTORY_HOST}/",
+    }
+    resp = await _http_client.get(url, headers=headers, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _fahrenheit_to_celsius(value_f: float) -> float:
+    return (value_f - 32.0) * (5.0 / 9.0)
+
+
+def _round_half_away_from_zero(value: float) -> int:
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
+async def _fetch_event_for_date(
+    sb: SupabaseWriter, *, date_kst: str
+) -> Optional[Dict[str, Any]]:
+    rows = await sb.select(
+        "events",
+        select="id,slug,date_kst",
+        filters={"date_kst": f"eq.{date_kst}"},
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
+async def _fetch_markets_for_event(
+    sb: SupabaseWriter, *, event_id: str
+) -> List[Dict[str, Any]]:
+    return await sb.select(
+        "event_markets",
+        select=(
+            "id,group_item_title,lower_bound_celsius,upper_bound_celsius,"
+            "group_item_threshold,yes_token_id,no_token_id"
+        ),
+        filters={"event_id": f"eq.{event_id}"},
+        order="group_item_threshold.asc",
+    )
+
+
+async def _compute_day_high_c(
+    sb: SupabaseWriter, *, date_kst: date
+) -> Optional[int]:
+    day_str = date_kst.isoformat()
+    rows = await sb.select(
+        "weather_day_high_changes",
+        select="high_celsius,observed_at",
+        filters={"date_kst": f"eq.{day_str}"},
+        order="observed_at.desc",
+        limit=1,
+    )
+    if rows:
+        high_val = _coerce_int(rows[0].get("high_celsius"))
+        if high_val is not None:
+            return high_val
+
+    start_utc = _kst_datetime(date_kst, "00:00").astimezone(timezone.utc)
+    end_utc = _kst_datetime(date_kst, "24:00").astimezone(timezone.utc)
+    obs_rows = await sb.select(
+        "weather_metar_obs",
+        select="observed_at,temp_c,source",
+        filters={"observed_at": f"gte.{start_utc.isoformat()}"},
+        order="observed_at.asc",
+    )
+    max_temp: Optional[float] = None
+    for row in obs_rows:
+        observed_at = row.get("observed_at")
+        if not isinstance(observed_at, str):
             continue
-        observed = entry.get("observed")
-        temperature = entry.get("temperature")
-        temp_c = None
-        if isinstance(temperature, dict):
-            temp_c = temperature.get("celsius")
-        temp_c = _coerce_float(temp_c)
-        if observed is None or temp_c is None:
+        try:
+            observed_dt = _parse_iso(observed_at)
+        except ValueError:
             continue
-        normalized.append({"reportTime": observed, "temp": temp_c, "raw": entry})
-    return normalized
+        if observed_dt >= end_utc:
+            break
+        temp_c = _coerce_float(row.get("temp_c"))
+        if temp_c is None:
+            continue
+        if max_temp is None or temp_c > max_temp:
+            max_temp = temp_c
+    if max_temp is None:
+        return None
+    return _round_half_away_from_zero(max_temp)
+
+
+async def _fetch_new_high_events(
+    sb: SupabaseWriter, *, date_kst: date
+) -> List[Dict[str, Any]]:
+    day_str = date_kst.isoformat()
+    rows = await sb.select(
+        "weather_day_high_changes",
+        select="observed_at,previous_high_celsius,high_celsius,source",
+        filters={"date_kst": f"eq.{day_str}"},
+        order="observed_at.asc",
+    )
+    events: List[Dict[str, Any]] = []
+    if rows:
+        for row in rows:
+            observed_at = row.get("observed_at")
+            if not isinstance(observed_at, str):
+                continue
+            try:
+                obs_dt = _parse_iso(observed_at)
+            except ValueError:
+                continue
+            events.append(
+                {
+                    "observed_at": obs_dt,
+                    "observed_kst": _format_kst_hhmm(obs_dt),
+                    "previous_high_celsius": _coerce_int(row.get("previous_high_celsius")),
+                    "high_celsius": _coerce_int(row.get("high_celsius")),
+                    "source": row.get("source"),
+                }
+            )
+        return events
+
+    start_utc = _kst_datetime(date_kst, "00:00").astimezone(timezone.utc)
+    end_utc = _kst_datetime(date_kst, "24:00").astimezone(timezone.utc)
+    obs_rows = await sb.select(
+        "weather_metar_obs",
+        select="observed_at,temp_c,source",
+        filters={"observed_at": f"gte.{start_utc.isoformat()}"},
+        order="observed_at.asc",
+    )
+    current_high: Optional[int] = None
+    for row in obs_rows:
+        observed_at = row.get("observed_at")
+        if not isinstance(observed_at, str):
+            continue
+        try:
+            obs_dt = _parse_iso(observed_at)
+        except ValueError:
+            continue
+        if obs_dt >= end_utc:
+            break
+        temp_c = _coerce_float(row.get("temp_c"))
+        if temp_c is None:
+            continue
+        whole_c = _round_half_away_from_zero(temp_c)
+        if current_high is None or whole_c > current_high:
+            events.append(
+                {
+                    "observed_at": obs_dt,
+                    "observed_kst": _format_kst_hhmm(obs_dt),
+                    "previous_high_celsius": current_high,
+                    "high_celsius": whole_c,
+                    "source": row.get("source"),
+                }
+            )
+            current_high = whole_c
+    return events
+
+
+def _default_market_id_for_high(
+    markets: List[Dict[str, Any]], *, high_c: Optional[int]
+) -> Optional[str]:
+    if high_c is not None:
+        for row in markets:
+            lower = _coerce_int(row.get("lower_bound_celsius"))
+            upper = _coerce_int(row.get("upper_bound_celsius"))
+            if _market_matches_bucket(lower, upper, high_c):
+                market_id = row.get("id")
+                if isinstance(market_id, str):
+                    return market_id
+    sorted_markets = _sorted_markets(markets)
+    if not sorted_markets:
+        return None
+    mid = sorted_markets[len(sorted_markets) // 2]
+    return mid.get("id") if isinstance(mid.get("id"), str) else None
+
+
+async def _fetch_snapshots_for_market(
+    sb: SupabaseWriter,
+    *,
+    market_id: str,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[Dict[str, Any]]:
+    rows = await sb.select(
+        "market_snapshots",
+        select=(
+            "captured_at,yes_best_bid,yes_best_ask,no_best_bid,no_best_ask,"
+            "yes_bid_size,yes_ask_size,no_bid_size,no_ask_size,accepting_orders"
+        ),
+        filters={
+            "market_id": f"eq.{market_id}",
+            "captured_at": f"gte.{start_utc.isoformat()}",
+        },
+        order="captured_at.asc",
+    )
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        captured_at = row.get("captured_at")
+        if not isinstance(captured_at, str):
+            continue
+        try:
+            captured_dt = _parse_iso(captured_at)
+        except ValueError:
+            continue
+        if captured_dt > end_utc:
+            break
+        out.append(row)
+    return out
+
+
+async def _fetch_temp_obs_for_day(
+    sb: SupabaseWriter, *, date_kst: date, source: str
+) -> List[tuple[datetime, float]]:
+    day_start_utc = _kst_datetime(date_kst, "00:00").astimezone(timezone.utc)
+    day_end_utc = _kst_datetime(date_kst, "24:00").astimezone(timezone.utc)
+    rows = await sb.select(
+        "weather_metar_obs",
+        select="observed_at,temp_c,source,station",
+        filters={
+            "station": "eq.RKSI",
+            "source": f"eq.{source}",
+            "observed_at": f"gte.{day_start_utc.isoformat()}",
+        },
+        order="observed_at.asc",
+    )
+    out: List[tuple[datetime, float]] = []
+    for row in rows:
+        observed_at = row.get("observed_at")
+        if not isinstance(observed_at, str):
+            continue
+        try:
+            obs_dt = _parse_iso(observed_at)
+        except ValueError:
+            continue
+        if obs_dt >= day_end_utc:
+            break
+        temp_c = _coerce_float(row.get("temp_c"))
+        if temp_c is None:
+            continue
+        out.append((obs_dt, temp_c))
+    return out
+
+
+def _temps_for_anchors(
+    observations: List[tuple[datetime, float]], anchors_utc: List[datetime]
+) -> List[Optional[float]]:
+    temps: List[Optional[float]] = []
+    idx = 0
+    last_temp: Optional[float] = None
+    for anchor in anchors_utc:
+        while idx < len(observations) and observations[idx][0] <= anchor:
+            last_temp = observations[idx][1]
+            idx += 1
+        temps.append(last_temp)
+    return temps
+
+
+async def _build_temp_series(
+    sb: SupabaseWriter, *, date_kst: date, anchors_utc: List[datetime]
+) -> tuple[List[Optional[float]], Optional[str]]:
+    for source in ("awc",):
+        obs = await _fetch_temp_obs_for_day(sb, date_kst=date_kst, source=source)
+        if obs:
+            return _temps_for_anchors(obs, anchors_utc), source
+    return [None for _ in anchors_utc], None
+
+
+def _html_to_text(payload: str) -> str:
+    payload = re.sub(r"(?is)<script.*?</script>", " ", payload)
+    payload = re.sub(r"(?is)<style.*?</style>", " ", payload)
+    payload = re.sub(r"(?s)<[^>]+>", " ", payload)
+    payload = html.unescape(payload)
+    payload = re.sub(r"\s+", " ", payload)
+    return payload.strip()
+
+
+def _extract_wu_temp(text: str, *, section: str, label: str) -> Optional[tuple[float, str]]:
+    pattern = rf"{section}\s+{label}\s+(-?\d+(?:\.\d+)?)\s*°?\s*([FC])"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = _coerce_float(match.group(1))
+    if value is None:
+        return None
+    unit = match.group(2).upper()
+    if unit not in ("F", "C"):
+        return None
+    return value, unit
+
+
+def _parse_wu_latest_observation(
+    text: str, *, local_date: datetime.date
+) -> Optional[Dict[str, Any]]:
+    idx = text.lower().find("observations")
+    scoped = text[idx:] if idx >= 0 else text
+    matches = list(
+        re.finditer(
+            r"(\d{1,2}:\d{2})\s*(AM|PM)?\s+(-?\d+(?:\.\d+)?)\s*°?\s*([FC])",
+            scoped,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return None
+
+    best_minutes: Optional[int] = None
+    best_value: Optional[float] = None
+    best_unit: Optional[str] = None
+    for match in matches:
+        time_part = match.group(1)
+        ampm = match.group(2).upper() if match.group(2) else None
+        value = _coerce_float(match.group(3))
+        unit = match.group(4).upper()
+        if value is None or unit not in ("F", "C"):
+            continue
+        try:
+            hour_str, minute_str = time_part.split(":")
+            hour = int(hour_str)
+            minute = int(minute_str)
+        except ValueError:
+            continue
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            continue
+        minutes = hour * 60 + minute
+        if best_minutes is None or minutes > best_minutes:
+            best_minutes = minutes
+            best_value = value
+            best_unit = unit
+
+    if best_minutes is None or best_value is None or best_unit is None:
+        return None
+
+    observed_at = datetime.combine(local_date, datetime.min.time()).replace(tzinfo=SEOUL_TZ) + timedelta(
+        minutes=best_minutes
+    )
+    temp_c = best_value if best_unit == "C" else _fahrenheit_to_celsius(best_value)
+    return {
+        "observedAt": observed_at.isoformat(),
+        "tempC": round(temp_c, 2),
+        "unit": best_unit,
+        "temp": best_value,
+    }
+
+
+def _parse_wu_history(html_payload: str, *, local_date: datetime.date, url: str) -> Optional[Dict[str, Any]]:
+    text = _html_to_text(html_payload)
+    high = _extract_wu_temp(text, section="Temperature", label="High")
+    low = _extract_wu_temp(text, section="Temperature", label="Low")
+    if high is None or low is None:
+        high = high or _extract_wu_temp(text, section="Daily Summary", label="High")
+        low = low or _extract_wu_temp(text, section="Daily Summary", label="Low")
+
+    day_high_c = None
+    if high is not None:
+        value, unit = high
+        day_high_c = value if unit == "C" else _fahrenheit_to_celsius(value)
+
+    day_low_c = None
+    if low is not None:
+        value, unit = low
+        day_low_c = value if unit == "C" else _fahrenheit_to_celsius(value)
+
+    latest = _parse_wu_latest_observation(text, local_date=local_date)
+
+    payload: Dict[str, Any] = {
+        "source": "wunderground_history",
+        "url": url,
+        "dateKst": local_date.isoformat(),
+        "dayHighC": round(day_high_c, 2) if isinstance(day_high_c, (int, float)) else None,
+        "dayLowC": round(day_low_c, 2) if isinstance(day_low_c, (int, float)) else None,
+    }
+    if isinstance(day_high_c, (int, float)):
+        payload["dayHighCelsiusWhole"] = _round_half_away_from_zero(day_high_c)
+    if isinstance(day_low_c, (int, float)):
+        payload["dayLowCelsiusWhole"] = _round_half_away_from_zero(day_low_c)
+    if latest:
+        payload["current"] = latest
+    return payload
 
 
 async def _fetch_event(slug: str) -> Optional[Dict[str, Any]]:
@@ -493,16 +969,6 @@ def _latest_hour_index(values: List[Optional[float]]) -> Optional[int]:
     return None
 
 
-def _latest_common_hour_index(
-    left: List[Optional[float]], right: List[Optional[float]]
-) -> Optional[int]:
-    limit = min(len(left), len(right))
-    for idx in range(limit - 1, -1, -1):
-        if isinstance(left[idx], (int, float)) and isinstance(right[idx], (int, float)):
-            return idx
-    return None
-
-
 def _max_optional(values: List[Optional[float]]) -> Optional[float]:
     present = [val for val in values if isinstance(val, (int, float))]
     return max(present) if present else None
@@ -583,7 +1049,6 @@ async def _persist_to_supabase(
     event: Optional[Dict[str, Any]],
     market_state: List[Dict[str, Any]],
     metar_awc: List[Dict[str, Any]],
-    metar_checkwx: List[Dict[str, Any]],
     forecast: Optional[Dict[str, Any]],
     forecast_cache_ts: Optional[float],
 ) -> None:
@@ -618,28 +1083,6 @@ async def _persist_to_supabase(
                             "visibility": awc_latest.get("visib"),
                             "flight_category": awc_latest.get("fltCat"),
                             "raw": awc_latest,
-                        },
-                        on_conflict="station,source,observed_at",
-                    )
-
-        checkwx_latest = _latest_metar_observation(metar_checkwx)
-        if checkwx_latest:
-            report_time = checkwx_latest.get("reportTime") or checkwx_latest.get("receiptTime")
-            if isinstance(report_time, str):
-                try:
-                    observed_at = _parse_iso(report_time).isoformat()
-                except ValueError:
-                    observed_at = None
-                temp_c = _coerce_float(checkwx_latest.get("temp"))
-                if observed_at and temp_c is not None:
-                    await _supabase.upsert(
-                        "weather_metar_obs",
-                        {
-                            "station": "RKSI",
-                            "source": "checkwx",
-                            "observed_at": observed_at,
-                            "temp_c": temp_c,
-                            "raw": checkwx_latest.get("raw"),
                         },
                         on_conflict="station,source,observed_at",
                     )
@@ -870,6 +1313,108 @@ async def _persist_to_supabase(
         return
 
 
+async def _persist_wunderground_to_supabase(
+    *,
+    captured_at: datetime,
+    local_date: datetime.date,
+    wu_history: Optional[Dict[str, Any]],
+) -> None:
+    if not _supabase or not _supabase.enabled() or not isinstance(wu_history, dict):
+        return
+
+    current = wu_history.get("current")
+    if isinstance(current, dict):
+        observed_at = current.get("observedAt")
+        temp_c = _coerce_float(current.get("tempC"))
+        if isinstance(observed_at, str) and temp_c is not None:
+            await _supabase.upsert(
+                "weather_wu_obs",
+                {
+                    "station": "RKSI",
+                    "observed_at": observed_at,
+                    "temp_c": temp_c,
+                    "source_url": wu_history.get("url"),
+                    "raw": wu_history,
+                },
+                on_conflict="station,observed_at",
+            )
+
+    high_whole = _coerce_int(wu_history.get("dayHighCelsiusWhole"))
+    if high_whole is not None:
+        await _supabase.upsert(
+            "weather_day_high_changes",
+            {
+                "station": "RKSI",
+                "source": "wunderground",
+                "date_kst": local_date.isoformat(),
+                "observed_at": captured_at.astimezone(timezone.utc).isoformat(),
+                "previous_high_celsius": None,
+                "high_celsius": high_whole,
+            },
+            on_conflict="station,source,date_kst,high_celsius",
+        )
+
+
+async def _ensure_wu_observed_max_loaded(local_date: datetime.date) -> None:
+    key = local_date.isoformat()
+    if key in _wu_observed_max_loaded:
+        return
+    _wu_observed_max_loaded.add(key)
+    if not _supabase or not _supabase.enabled():
+        return
+    rows = await _supabase.select(
+        "weather_day_high_changes",
+        select="high_celsius",
+        filters={"source": "eq.wunderground_observed", "date_kst": f"eq.{key}"},
+        order="high_celsius.desc",
+        limit=1,
+    )
+    if rows:
+        high = _coerce_int(rows[0].get("high_celsius"))
+        if high is not None:
+            _wu_observed_max_by_date[key] = float(high)
+            _wu_observed_max_whole_by_date[key] = high
+
+
+async def _update_wu_observed_running_max(
+    *,
+    local_date: datetime.date,
+    wu_history: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(wu_history, dict):
+        return
+    current = wu_history.get("current")
+    if not isinstance(current, dict):
+        return
+    temp_c = _coerce_float(current.get("tempC"))
+    observed_at = current.get("observedAt")
+    if temp_c is None or not isinstance(observed_at, str):
+        return
+
+    await _ensure_wu_observed_max_loaded(local_date)
+
+    key = local_date.isoformat()
+    prev_max = _wu_observed_max_by_date.get(key)
+    if prev_max is None or temp_c > prev_max + 1e-6:
+        prev_whole = _wu_observed_max_whole_by_date.get(key)
+        new_whole = _round_half_away_from_zero(temp_c)
+        _wu_observed_max_by_date[key] = temp_c
+        _wu_observed_max_whole_by_date[key] = new_whole
+        if _supabase and _supabase.enabled():
+            await _supabase.upsert(
+                "weather_day_high_changes",
+                {
+                    "station": "RKSI",
+                    "source": "wunderground_observed",
+                    "date_kst": key,
+                    "observed_at": observed_at,
+                    "previous_high_celsius": prev_whole,
+                    "high_celsius": new_whole,
+                },
+                on_conflict="station,source,date_kst,high_celsius",
+            )
+
+
 async def _sleep_remaining(started_ts: float, interval_seconds: int) -> None:
     elapsed = time.time() - started_ts
     await asyncio.sleep(max(0.0, interval_seconds - elapsed))
@@ -1045,7 +1590,6 @@ async def _ingest_market_loop() -> None:
                 event=event,
                 market_state=market_state,
                 metar_awc=[],
-                metar_checkwx=[],
                 forecast=None,
                 forecast_cache_ts=None,
             )
@@ -1078,7 +1622,6 @@ async def _ingest_awc_loop() -> None:
                 event=None,
                 market_state=[],
                 metar_awc=metar_awc if isinstance(metar_awc, list) else [],
-                metar_checkwx=[],
                 forecast=None,
                 forecast_cache_ts=None,
             )
@@ -1090,59 +1633,32 @@ async def _ingest_awc_loop() -> None:
         await _sleep_remaining(started, AWC_TTL)
 
 
-async def _ingest_checkwx_loop() -> None:
-    global _latest_metar_checkwx
+async def _ingest_wunderground_loop() -> None:
+    global _latest_wu_history
     while True:
         started = time.time()
         try:
-            metar_checkwx = await _fetch_metar_checkwx()
-            if isinstance(metar_checkwx, list):
-                now_utc = datetime.now(timezone.utc)
-                cutoff = now_utc - timedelta(hours=48)
-                merged: Dict[str, Dict[str, Any]] = {}
-                async with _state_lock:
-                    for obs in _latest_metar_checkwx:
-                        report_time = obs.get("reportTime") or obs.get("receiptTime")
-                        if isinstance(report_time, str):
-                            merged[report_time] = obs
-                    for obs in metar_checkwx:
-                        report_time = obs.get("reportTime") or obs.get("receiptTime")
-                        if isinstance(report_time, str):
-                            merged[report_time] = obs
-
-                    pruned: List[tuple[datetime, Dict[str, Any]]] = []
-                    for report_time, obs in merged.items():
-                        try:
-                            dt = _parse_iso(report_time)
-                        except ValueError:
-                            continue
-                        if dt < cutoff:
-                            continue
-                        pruned.append((dt, obs))
-                    pruned.sort(key=lambda row: row[0])
-                    _latest_metar_checkwx = [obs for _, obs in pruned]
-            await _mark_health_success("checkwx")
-
             now_kst = _now_kst()
             local_date = now_kst.date()
-            slug = _build_slug(local_date)
-            await _persist_to_supabase(
-                captured_at=datetime.now(timezone.utc),
-                date_kst=local_date,
-                slug=slug,
-                event=None,
-                market_state=[],
-                metar_awc=[],
-                metar_checkwx=metar_checkwx if isinstance(metar_checkwx, list) else [],
-                forecast=None,
-                forecast_cache_ts=None,
+            url = _build_wu_history_url(local_date)
+            captured_at = datetime.now(timezone.utc)
+            html_payload = await _fetch_wu_history_html(url)
+            parsed = _parse_wu_history(html_payload, local_date=local_date, url=url)
+            async with _state_lock:
+                _latest_wu_history = parsed
+            await _mark_health_success("wunderground")
+            await _update_wu_observed_running_max(
+                local_date=local_date, wu_history=parsed
+            )
+            await _persist_wunderground_to_supabase(
+                captured_at=captured_at, local_date=local_date, wu_history=parsed
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await _mark_health_error("checkwx", exc)
+            await _mark_health_error("wunderground", exc)
 
-        await _sleep_remaining(started, CHECK_WX_TTL)
+        await _sleep_remaining(started, WU_TTL)
 
 
 async def _ingest_forecast_loop() -> None:
@@ -1168,7 +1684,6 @@ async def _ingest_forecast_loop() -> None:
                 event=None,
                 market_state=[],
                 metar_awc=[],
-                metar_checkwx=[],
                 forecast=fetched,
                 forecast_cache_ts=fetched_ts,
             )
@@ -1209,60 +1724,58 @@ async def dashboard() -> Dict[str, Any]:
         event = _latest_event if state_slug == slug else None
         outcomes = _latest_market_outcomes if state_slug == slug else []
         metar_awc = _latest_metar_awc
-        metar_checkwx = _latest_metar_checkwx
+        wu_history = _latest_wu_history
         forecast = _latest_forecast
         balance = _latest_balance
         positions = _latest_positions
         health = {key: dict(val) for key, val in _health.items()}
 
+    await _ensure_wu_observed_max_loaded(local_date)
     awc_actuals = _actuals_for_date(metar_awc, local_date, now_kst)
-    checkwx_actuals = _actuals_for_date(metar_checkwx, local_date, now_kst)
     axis_times = _format_axis_times(local_date)
 
     awc_latest_idx = _latest_hour_index(awc_actuals["hourly"])
-    checkwx_latest_idx = _latest_hour_index(checkwx_actuals["hourly"])
     awc_latest = (
         awc_actuals["hourly"][awc_latest_idx]
         if awc_latest_idx is not None
         else None
     )
-    checkwx_latest = (
-        checkwx_actuals["hourly"][checkwx_latest_idx]
-        if checkwx_latest_idx is not None
-        else None
-    )
     awc_latest_time = (
         axis_times[awc_latest_idx] if awc_latest_idx is not None else None
     )
-    checkwx_latest_time = (
-        axis_times[checkwx_latest_idx] if checkwx_latest_idx is not None else None
-    )
 
     awc_latest_observed_at = _latest_observed_at_for_date(metar_awc, local_date, now_kst)
-    checkwx_latest_observed_at = _latest_observed_at_for_date(
-        metar_checkwx, local_date, now_kst
+
+    wu_current_temp = None
+    if isinstance(wu_history, dict):
+        current = wu_history.get("current")
+        if isinstance(current, dict):
+            wu_current_temp = _coerce_float(current.get("tempC"))
+
+    wu_key = local_date.isoformat()
+    wu_observed_max = _wu_observed_max_by_date.get(wu_key)
+    wu_observed_max_whole = _wu_observed_max_whole_by_date.get(wu_key)
+
+    wu_day_high = _coerce_float(wu_history.get("dayHighC")) if isinstance(wu_history, dict) else None
+    wu_day_high_whole = (
+        _coerce_int(wu_history.get("dayHighCelsiusWhole")) if isinstance(wu_history, dict) else None
     )
-
-    delta = None
-    match = None
-    if (
-        awc_latest_observed_at
-        and checkwx_latest_observed_at
-        and awc_latest_observed_at == checkwx_latest_observed_at
-    ):
-        compare_idx = _latest_common_hour_index(
-            awc_actuals["hourly"], checkwx_actuals["hourly"]
-        )
-        if compare_idx is not None:
-            awc_compare = awc_actuals["hourly"][compare_idx]
-            checkwx_compare = checkwx_actuals["hourly"][compare_idx]
-            if isinstance(awc_compare, (int, float)) and isinstance(
-                checkwx_compare, (int, float)
-            ):
-                delta = round(checkwx_compare - awc_compare, 2)
-                match = abs(delta) < 0.05
-
-    day_high = _max_optional([awc_actuals["day_high"], checkwx_actuals["day_high"]])
+    day_high = (
+        wu_day_high
+        if wu_day_high is not None
+        else wu_observed_max
+        if wu_observed_max is not None
+        else _max_optional([awc_actuals["day_high"]])
+    )
+    day_high_whole = (
+        wu_day_high_whole
+        if wu_day_high_whole is not None
+        else wu_observed_max_whole
+        if wu_observed_max_whole is not None
+        else _round_half_away_from_zero(day_high)
+        if isinstance(day_high, (int, float))
+        else None
+    )
 
     return {
         "meta": {
@@ -1276,24 +1789,45 @@ async def dashboard() -> Dict[str, Any]:
             "hourly": {
                 "times": axis_times,
                 "awc": awc_actuals["hourly"],
-                "checkwx": checkwx_actuals["hourly"],
             },
             "dayHigh": day_high,
+            "dayHighCelsiusWhole": day_high_whole,
+            "wunderground": (
+                {
+                    **wu_history,
+                    "observedMaxC": round(wu_observed_max, 2)
+                    if isinstance(wu_observed_max, (int, float))
+                    else None,
+                    "observedMaxCelsiusWhole": wu_observed_max_whole,
+                }
+                if isinstance(wu_history, dict)
+                else {
+                    "source": "wunderground_history",
+                    "observedMaxC": round(wu_observed_max, 2)
+                    if isinstance(wu_observed_max, (int, float))
+                    else None,
+                    "observedMaxCelsiusWhole": wu_observed_max_whole,
+                }
+            ),
             "sources": {
                 "awc": {
                     "latest": awc_latest,
                     "latestTime": awc_latest_time,
                     "latestObservedAt": awc_latest_observed_at,
                     "dayHigh": awc_actuals["day_high"],
+                    "deltaVsWunderground": (
+                        round(awc_actuals["day_high"] - (wu_day_high or wu_observed_max), 2)
+                        if isinstance(awc_actuals["day_high"], (int, float))
+                        and isinstance((wu_day_high or wu_observed_max), (int, float))
+                        else None
+                    ),
+                    "latestDeltaVsWunderground": (
+                        round(awc_latest - wu_current_temp, 2)
+                        if isinstance(awc_latest, (int, float))
+                        and isinstance(wu_current_temp, (int, float))
+                        else None
+                    ),
                 },
-                "checkwx": {
-                    "latest": checkwx_latest,
-                    "latestTime": checkwx_latest_time,
-                    "latestObservedAt": checkwx_latest_observed_at,
-                    "dayHigh": checkwx_actuals["day_high"],
-                },
-                "match": match,
-                "delta": delta,
             },
         },
         "market": {
@@ -1305,4 +1839,302 @@ async def dashboard() -> Dict[str, Any]:
             "balance": balance,
             "positions": positions,
         },
+    }
+
+
+@app.get("/api/trends/dates")
+async def trend_dates() -> Dict[str, Any]:
+    sb = _require_supabase()
+    rows = await sb.select("events", select="date_kst", order="date_kst.desc")
+    seen: set[str] = set()
+    dates: List[str] = []
+    for row in rows:
+        value = row.get("date_kst")
+        if isinstance(value, str) and value not in seen:
+            seen.add(value)
+            dates.append(value)
+    return {"dates": dates}
+
+
+@app.get("/api/trends/markets")
+async def trend_markets(
+    date_kst: str = Query(..., description="KST date (YYYY-MM-DD)")
+) -> Dict[str, Any]:
+    sb = _require_supabase()
+    day = _parse_date_kst(date_kst)
+    event = await _fetch_event_for_date(sb, date_kst=date_kst)
+    if not event:
+        raise HTTPException(status_code=404, detail="No event for date")
+    event_id = event.get("id")
+    if not isinstance(event_id, str):
+        raise HTTPException(status_code=500, detail="Event id missing")
+    markets = await _fetch_markets_for_event(sb, event_id=event_id)
+    day_high_c = await _compute_day_high_c(sb, date_kst=day)
+    default_market_id = _default_market_id_for_high(markets, high_c=day_high_c)
+    return {
+        "date_kst": date_kst,
+        "slug": event.get("slug"),
+        "event_id": event_id,
+        "day_high_c": day_high_c,
+        "default_market_id": default_market_id,
+        "markets": markets,
+    }
+
+
+@app.get("/api/trends")
+async def trend_series(
+    date_kst: str = Query(..., description="KST date (YYYY-MM-DD)"),
+    market_id: Optional[str] = Query(None),
+    start_kst: str = Query("00:00"),
+    end_kst: str = Query("24:00"),
+    interval_minutes: int = Query(15, ge=1, le=240),
+    mode: str = Query("closest", pattern="^(closest|carry)$"),
+) -> Dict[str, Any]:
+    sb = _require_supabase()
+    day = _parse_date_kst(date_kst)
+    event = await _fetch_event_for_date(sb, date_kst=date_kst)
+    if not event:
+        raise HTTPException(status_code=404, detail="No event for date")
+    event_id = event.get("id")
+    if not isinstance(event_id, str):
+        raise HTTPException(status_code=500, detail="Event id missing")
+
+    markets = await _fetch_markets_for_event(sb, event_id=event_id)
+    if not market_id:
+        day_high_c = await _compute_day_high_c(sb, date_kst=day)
+        market_id = _default_market_id_for_high(markets, high_c=day_high_c)
+    if not market_id:
+        raise HTTPException(status_code=404, detail="Market not found")
+
+    start_dt_kst = _kst_datetime(day, start_kst)
+    end_dt_kst = _kst_datetime(day, end_kst)
+    if end_dt_kst <= start_dt_kst:
+        raise HTTPException(
+            status_code=400, detail="end_kst must be after start_kst"
+        )
+    start_utc = start_dt_kst.astimezone(timezone.utc)
+    end_utc = end_dt_kst.astimezone(timezone.utc)
+
+    snapshots = await _fetch_snapshots_for_market(
+        sb, market_id=market_id, start_utc=start_utc, end_utc=end_utc
+    )
+    anchors_kst: List[datetime] = []
+    anchors_utc: List[datetime] = []
+    current = start_dt_kst
+    while current <= end_dt_kst:
+        anchors_kst.append(current)
+        anchors_utc.append(current.astimezone(timezone.utc))
+        current += timedelta(minutes=interval_minutes)
+
+    temps, temp_source = await _build_temp_series(
+        sb, date_kst=day, anchors_utc=anchors_utc
+    )
+
+    resampled = _resample_to_anchors(snapshots, anchors_utc, mode=mode)
+    series: List[Dict[str, Any]] = []
+    missing = 0
+    for anchor_kst_dt, anchor_utc_dt, row, temp_c in zip(
+        anchors_kst, anchors_utc, resampled, temps
+    ):
+        captured_at = row.get("captured_at") if row else None
+        if not captured_at:
+            missing += 1
+        series.append(
+            {
+                "anchor_kst": anchor_kst_dt.strftime("%H:%M"),
+                "anchor_utc": anchor_utc_dt.isoformat(),
+                "captured_at": captured_at,
+                "temp_c": temp_c,
+                "yes_best_bid": row.get("yes_best_bid"),
+                "yes_best_ask": row.get("yes_best_ask"),
+                "no_best_bid": row.get("no_best_bid"),
+                "no_best_ask": row.get("no_best_ask"),
+                "yes_bid_size": row.get("yes_bid_size"),
+                "yes_ask_size": row.get("yes_ask_size"),
+                "no_bid_size": row.get("no_bid_size"),
+                "no_ask_size": row.get("no_ask_size"),
+                "accepting_orders": row.get("accepting_orders"),
+            }
+        )
+
+    market_label = None
+    for row in markets:
+        if row.get("id") == market_id:
+            market_label = row.get("group_item_title")
+            break
+
+    coverage = {
+        "snapshots": len(snapshots),
+        "first_snapshot": snapshots[0].get("captured_at") if snapshots else None,
+        "last_snapshot": snapshots[-1].get("captured_at") if snapshots else None,
+        "resampled_points": len(series),
+        "missing_points": missing,
+    }
+
+    return {
+        "meta": {
+            "date_kst": date_kst,
+            "slug": event.get("slug"),
+            "event_id": event_id,
+            "market_id": market_id,
+            "market_label": market_label,
+            "temp_source": temp_source,
+            "timezone": "Asia/Seoul",
+            "interval_minutes": interval_minutes,
+            "start_kst": start_kst,
+            "end_kst": end_kst,
+            "mode": mode,
+        },
+        "coverage": coverage,
+        "series": series,
+    }
+
+
+@app.get("/api/new-highs")
+async def new_highs(
+    date_kst: str = Query(..., description="KST date (YYYY-MM-DD)")
+) -> Dict[str, Any]:
+    sb = _require_supabase()
+    day = _parse_date_kst(date_kst)
+    events = await _fetch_new_high_events(sb, date_kst=day)
+    payload = [
+        {
+            "observed_at": item["observed_at"].isoformat(),
+            "observed_kst": item["observed_kst"],
+            "previous_high_celsius": item["previous_high_celsius"],
+            "high_celsius": item["high_celsius"],
+            "source": item.get("source"),
+        }
+        for item in events
+    ]
+    return {"date_kst": date_kst, "events": payload}
+
+
+@app.get("/api/event-study")
+async def event_study(
+    date_kst: str = Query(..., description="KST date (YYYY-MM-DD)"),
+    high_c: Optional[int] = Query(None),
+    pre_minutes: int = Query(60, ge=1, le=720),
+    post_minutes: int = Query(120, ge=1, le=720),
+    interval_minutes: int = Query(5, ge=1, le=120),
+    markets: str = Query("prev,new"),
+    mode: str = Query("closest", pattern="^(closest|carry)$"),
+) -> Dict[str, Any]:
+    sb = _require_supabase()
+    day = _parse_date_kst(date_kst)
+    event = await _fetch_event_for_date(sb, date_kst=date_kst)
+    if not event:
+        raise HTTPException(status_code=404, detail="No event for date")
+    event_id = event.get("id")
+    if not isinstance(event_id, str):
+        raise HTTPException(status_code=500, detail="Event id missing")
+    markets_all = await _fetch_markets_for_event(sb, event_id=event_id)
+
+    new_high_events = await _fetch_new_high_events(sb, date_kst=day)
+    if not new_high_events:
+        return {"meta": {"date_kst": date_kst}, "event": None, "series": []}
+
+    selected_event = None
+    if high_c is not None:
+        for item in new_high_events:
+            if item.get("high_celsius") == high_c:
+                selected_event = item
+                break
+    if selected_event is None:
+        selected_event = new_high_events[-1]
+    selected_high = selected_event.get("high_celsius")
+    observed_at = selected_event.get("observed_at")
+    if not isinstance(selected_high, int) or not isinstance(observed_at, datetime):
+        raise HTTPException(status_code=500, detail="Invalid new-high event")
+
+    tokens = [token.strip() for token in markets.split(",") if token.strip()]
+    market_ids: List[str] = []
+    for token in tokens:
+        if token == "prev":
+            prev_id = _default_market_id_for_high(markets_all, high_c=selected_high - 1)
+            if prev_id:
+                market_ids.append(prev_id)
+        elif token == "new":
+            new_id = _default_market_id_for_high(markets_all, high_c=selected_high)
+            if new_id:
+                market_ids.append(new_id)
+        else:
+            for row in markets_all:
+                if row.get("id") == token:
+                    market_ids.append(token)
+                    break
+
+    # de-duplicate while preserving order
+    seen_ids: set[str] = set()
+    market_ids = [mid for mid in market_ids if not (mid in seen_ids or seen_ids.add(mid))]
+
+    start_utc = observed_at - timedelta(minutes=pre_minutes)
+    end_utc = observed_at + timedelta(minutes=post_minutes)
+    anchors_utc: List[datetime] = []
+    offsets: List[int] = []
+    current = -pre_minutes
+    while current <= post_minutes:
+        offsets.append(current)
+        anchors_utc.append(observed_at + timedelta(minutes=current))
+        current += interval_minutes
+
+    series_by_market: List[Dict[str, Any]] = []
+    for market_id in market_ids:
+        snapshots = await _fetch_snapshots_for_market(
+            sb, market_id=market_id, start_utc=start_utc, end_utc=end_utc
+        )
+        resampled = _resample_to_anchors(snapshots, anchors_utc, mode=mode)
+        points: List[Dict[str, Any]] = []
+        for offset, anchor_utc, row in zip(offsets, anchors_utc, resampled):
+            captured_at = row.get("captured_at") if row else None
+            points.append(
+                {
+                    "offset_minutes": offset,
+                    "anchor_utc": anchor_utc.isoformat(),
+                    "anchor_kst": _format_kst_hhmm(anchor_utc),
+                    "captured_at": captured_at,
+                    "yes_best_bid": row.get("yes_best_bid"),
+                    "yes_best_ask": row.get("yes_best_ask"),
+                    "no_best_bid": row.get("no_best_bid"),
+                    "no_best_ask": row.get("no_best_ask"),
+                    "yes_bid_size": row.get("yes_bid_size"),
+                    "yes_ask_size": row.get("yes_ask_size"),
+                    "no_bid_size": row.get("no_bid_size"),
+                    "no_ask_size": row.get("no_ask_size"),
+                    "accepting_orders": row.get("accepting_orders"),
+                }
+            )
+        label = None
+        for row in markets_all:
+            if row.get("id") == market_id:
+                label = row.get("group_item_title")
+                break
+        series_by_market.append(
+            {
+                "market_id": market_id,
+                "market_label": label,
+                "points": points,
+            }
+        )
+
+    return {
+        "meta": {
+            "date_kst": date_kst,
+            "event_id": event_id,
+            "slug": event.get("slug"),
+            "high_celsius": selected_high,
+            "observed_at": observed_at.isoformat(),
+            "observed_kst": _format_kst_hhmm(observed_at),
+            "pre_minutes": pre_minutes,
+            "post_minutes": post_minutes,
+            "interval_minutes": interval_minutes,
+            "mode": mode,
+        },
+        "event": {
+            "previous_high_celsius": selected_event.get("previous_high_celsius"),
+            "high_celsius": selected_high,
+            "observed_at": observed_at.isoformat(),
+            "observed_kst": _format_kst_hhmm(observed_at),
+        },
+        "series": series_by_market,
     }
